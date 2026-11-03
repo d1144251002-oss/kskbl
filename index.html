@@ -1,266 +1,167 @@
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>斑馬線 AI 離線辨識系統 (ONNX Runtime)</title>
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
-    <style>
-        body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f9; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        #status { font-weight: bold; color: #2e7d32; margin: 10px 0; }
-        canvas { max-width: 100%; height: auto; margin-top: 15px; border: 2px solid #ddd; border-radius: 8px; }
-        .controls { display: flex; gap: 12px; justify-content: center; align-items: center; flex-wrap: wrap; margin: 12px 0; }
-        button { padding: 9px 18px; font-size: 15px; border: 0; border-radius: 8px; background: #1976d2; color: #fff; cursor: pointer; }
-        button:disabled { background: #aaa; cursor: not-allowed; }
-        button.stop { background: #d32f2f; }
-        #fps { color: #666; font-size: 14px; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>斑馬線退縮距離檢測｜視訊＋圖片</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
 </head>
 <body>
-
-<div class="container">
-    <h2>🚦 斑馬線（Crosswalk）離線 AI 辨識系統</h2>
-    <p style="font-size:14px">視訊＋上傳版 ｜ <a href="image.html">切換到純圖片版</a></p>
-    <div id="status">⏳ 正在載入 ONNX 模型中，請稍候...</div>
-    <div class="controls">
-        <input type="file" id="imageInput" accept="image/*" disabled>
-        <button id="camBtn" disabled>📹 開啟視訊</button>
-        <span id="fps"></span>
+<header class="hero">
+  <div class="hero-inner">
+    <span class="site">校園道路安全 AI 辨識專題</span>
+    <h1>斑馬線退縮距離 AI 檢測</h1>
+    <p>上傳路口照片或開啟鏡頭，模型直接在你的瀏覽器裡找出斑馬線，並判斷它離路口轉角是否太近。</p>
+    <nav class="signs" aria-label="辨識模式"><a class="sign" href="index.html" aria-current="page"><small>本機模型，離線辨識</small><b>斑馬線・視訊＋圖片</b></a><a class="sign" href="image.html"><small>本機模型，上傳照片</small><b>斑馬線・僅圖片</b></a><a class="sign" href="roboflow.html"><small>Roboflow 模型</small><b>交通號誌・雲端</b></a></nav>
+  </div>
+</header>
+<div class="centerline" aria-hidden="true"></div>
+<main>
+  <section class="stage-wrap" aria-label="辨識畫面">
+    <div class="statusbar busy" id="statusbar"><span class="dot"></span><span id="status" role="status">準備中…</span></div>
+    <div class="stage" id="stage">
+      <div class="empty">
+        <strong>把照片拖曳到這裡</strong>
+        或使用右側的按鈕選擇圖片，也可以開啟視訊即時辨識。
+      </div>
+      <canvas id="outputCanvas" width="640" height="360"></canvas>
     </div>
-    <canvas id="outputCanvas"></canvas>
-</div>
-<video id="video" playsinline muted style="display:none"></video>
-
+  </section>
+  <aside>
+    <div class="panel"><h2>輸入</h2><div class="btns"><input type="file" id="imageInput" accept="image/*" disabled><label for="imageInput" class="btn ghost disabled" id="pickBtn">選擇圖片</label><button class="btn disabled" id="camBtn" type="button">開啟視訊</button><div class="fps" id="fps" aria-live="off"></div></div></div>
+    <div class="panel"><h2>辨識結果</h2><div class="result" id="report"><p>尚未辨識。選一張圖片就會在這裡顯示結果。</p></div></div>
+  </aside>
+</main>
+<video id="video" playsinline muted hidden></video>
+<footer>辨識結果僅供參考，實際道路安全請以現場勘查為準。</footer>
+<script src="common.js"></script>
 <script>
-    let session = null;
-    let stream = null;
-    let running = false;
-    const statusDiv = document.getElementById('status');
-    const imageInput = document.getElementById('imageInput');
-    const camBtn = document.getElementById('camBtn');
-    const fpsSpan = document.getElementById('fps');
-    const video = document.getElementById('video');
-    const canvas = document.getElementById('outputCanvas');
-    const ctx = canvas.getContext('2d');
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = 640; tempCanvas.height = 640;
-    const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
-    const CONF = 0.45;
 
-    // 1. 載入模型（內嵌於本頁）
-    async function initModel() {
-        try {
-            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
-            const res = await fetch('./best.onnx');
-            if (!res.ok) throw new Error('best.onnx HTTP ' + res.status);
-            const bytes = new Uint8Array(await res.arrayBuffer());
-            session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
-            statusDiv.innerText = "✅ 模型載入完成！請選擇圖片或開啟視訊進行辨識。";
-            imageInput.disabled = false;
-            camBtn.disabled = false;
-        } catch (e) {
-            statusDiv.innerText = "❌ 模型載入失敗，請確認 best.onnx 與本頁放在同一個資料夾，且網路可連線至 CDN。";
-            console.error(e);
-        }
+let session = null;
+const CONF = 0.45;
+const tmp = document.createElement('canvas'); tmp.width = 640; tmp.height = 640;
+const tctx = tmp.getContext('2d', { willReadFrequently: true });
+const canvas = $('outputCanvas'), ctx = canvas.getContext('2d');
+
+async function initModel() {
+  try {
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+    UI.status('正在載入斑馬線模型（約 10 MB）…', 'busy');
+    const res = await fetch('./best.onnx');
+    if (!res.ok) throw new Error('best.onnx HTTP ' + res.status);
+    session = await ort.InferenceSession.create(new Uint8Array(await res.arrayBuffer()), { executionProviders: ['wasm'] });
+    $('imageInput').disabled = false; $('pickBtn').classList.remove('disabled');
+    if ($('camBtn')) $('camBtn').classList.remove('disabled');
+    UI.status('模型已就緒，請選擇圖片' + ($('camBtn') ? '或開啟視訊。' : '。'));
+  } catch (e) {
+    UI.status('模型載入失敗：請確認 best.onnx 與本頁在同一個資料夾，且網路能連到 CDN。', 'err');
+    console.error(e);
+  }
+}
+function preprocess(src) {
+  tctx.drawImage(src, 0, 0, 640, 640);
+  const { data } = tctx.getImageData(0, 0, 640, 640);
+  const plane = 640 * 640, f = new Float32Array(3 * plane);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    f[p] = data[i] / 255; f[plane + p] = data[i + 1] / 255; f[2 * plane + p] = data[i + 2] / 255;
+  }
+  return new ort.Tensor('float32', f, [1, 3, 640, 640]);
+}
+async function detect(src, w, h) {
+  const out = await session.run({ images: preprocess(src) });
+  const d = out[Object.keys(out)[0]].data, boxes = [];
+  for (let i = 0; i < 8400; i++) {
+    const s = d[4 * 8400 + i];
+    if (s >= CONF) {
+      const cx = d[i], cy = d[8400 + i], bw = d[2 * 8400 + i], bh = d[3 * 8400 + i];
+      boxes.push({ x: (cx - bw / 2) * w / 640, y: (cy - bh / 2) * h / 640, w: bw * w / 640, h: bh * h / 640, score: s });
     }
+  }
+  return nms(boxes);
+}
+function nms(boxes) {
+  let c = boxes.sort((a, b) => b.score - a.score); const r = [];
+  while (c.length) { const cur = c.shift(); r.push(cur); c = c.filter(b => iou(cur, b) < 0.45); }
+  return r;
+}
+function iou(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y), x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+  const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1); return i / (a.w * a.h + b.w * b.h - i);
+}
+// 風險：斑馬線離畫面底部太近，或在畫面中佔太高
+const highRisk = (b, H) => (H - (b.y + b.h)) < H * 0.18 || b.h / H > 0.25;
 
-    // 統一推理：source 可為 Image 或 Video
-    async function detect(source, w, h) {
-        const tensor = preprocess(source);
-        const results = await session.run({ images: tensor });
-        return postprocess(results, w, h, CONF);
+function render(src, w, h, boxes) {
+  UI.showMedia();
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  ctx.drawImage(src, 0, 0, w, h);
+  const lw = Math.max(3, w / 220), fs = Math.max(15, w / 45);
+  boxes.forEach(b => {
+    const col = highRisk(b, h) ? '#d9452b' : '#2fb463';
+    ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.strokeRect(b.x, b.y, b.w, b.h);
+    const t = `斑馬線 ${(b.score * 100).toFixed(0)}%`;
+    ctx.font = `700 ${fs}px "Noto Sans TC", sans-serif`;
+    const tw = ctx.measureText(t).width, ly = Math.max(b.y, fs + 10);
+    ctx.fillStyle = col; ctx.fillRect(b.x, ly - fs - 10, tw + 14, fs + 10);
+    ctx.fillStyle = '#fff'; ctx.fillText(t, b.x + 7, ly - 6);
+  });
+  const rep = $('report');
+  if (!boxes.length) { rep.className = 'result'; rep.innerHTML = '<h3>沒有找到斑馬線</h3><p>換一張有斑馬線的路口照片試試。</p>'; return; }
+  const high = boxes.some(b => highRisk(b, h));
+  rep.className = 'result ' + (high ? 'high' : 'safe');
+  rep.innerHTML = high
+    ? `<h3>高風險</h3><p>找到 ${boxes.length} 處斑馬線，其中有一處太靠近路口轉角。轉彎車輛容易有視線死角，建議把斑馬線往後退縮 3～5 公尺。</p>`
+    : `<h3>安全</h3><p>找到 ${boxes.length} 處斑馬線，退縮距離良好，符合安全退縮的判斷條件。</p>`;
+}
+
+$('imageInput').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f || !session) return;
+  if (typeof stopCamera === 'function' && running) stopCamera();
+  const img = new Image(); img.src = URL.createObjectURL(f);
+  img.onload = async () => {
+    UI.status('辨識中…', 'busy');
+    const boxes = await detect(img, img.width, img.height);
+    render(img, img.width, img.height, boxes);
+    UI.status(boxes.length ? `辨識完成，找到 ${boxes.length} 處斑馬線。` : '辨識完成，沒有找到斑馬線。');
+  };
+});
+window.addEventListener('DOMContentLoaded', initModel);
+
+let stream = null, running = false;
+const video = $('video');
+$('camBtn').addEventListener('click', () => running ? stopCamera() : startCamera());
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 960 } }, audio: false });
+  } catch (e) { UI.status('無法開啟鏡頭：請允許瀏覽器使用攝影機，並確認網址是 https。', 'err'); return; }
+  video.srcObject = stream; await video.play();
+  running = true; $('camBtn').textContent = '關閉視訊'; $('camBtn').classList.add('stop');
+  UI.status('視訊辨識中…', 'busy'); loop();
+}
+function stopCamera() {
+  running = false; if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+  $('camBtn').textContent = '開啟視訊'; $('camBtn').classList.remove('stop'); $('fps').textContent = '';
+  UI.status('視訊已關閉。');
+}
+async function loop() {
+  let frames = 0, t0 = performance.now();
+  while (running) {
+    const w = video.videoWidth, h = video.videoHeight;
+    if (w && h) {
+      const boxes = await detect(video, w, h);
+      if (!running) break;
+      render(video, w, h, boxes); frames++;
+      const now = performance.now();
+      if (now - t0 >= 1000) { $('fps').textContent = `${(frames * 1000 / (now - t0)).toFixed(1)} FPS`; frames = 0; t0 = now; }
     }
+    await new Promise(r => requestAnimationFrame(r));
+  }
+}
 
-    // 2. 上傳圖片
-    imageInput.addEventListener('change', async (e) => {
-        const file = e.target.files[0];
-        if (!file || !session) return;
-        if (running) stopCamera();
-        const img = new Image();
-        img.src = URL.createObjectURL(file);
-        img.onload = async () => {
-            canvas.width = img.width;
-            canvas.height = img.height;
-            ctx.drawImage(img, 0, 0);
-            statusDiv.innerText = "⚡ 正在地端推理中...";
-            const boxes = await detect(img, img.width, img.height);
-            ctx.drawImage(img, 0, 0);
-            drawBoxes(boxes);
-            statusDiv.innerText = boxes.length
-                ? `✅ 辨識完成！共找到 ${boxes.length} 個斑馬線。`
-                : "⚠️ 未偵測到斑馬線！";
-        };
-    });
-
-    // 3. 視訊模式
-    camBtn.addEventListener('click', () => running ? stopCamera() : startCamera());
-
-    async function startCamera() {
-        try {
-            stream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: { ideal: 'environment' }, width: { ideal: 960 }, height: { ideal: 720 } },
-                audio: false
-            });
-        } catch (e) {
-            statusDiv.innerText = "❌ 無法開啟鏡頭，請允許瀏覽器使用攝影機（需 https 或 localhost）。";
-            console.error(e);
-            return;
-        }
-        video.srcObject = stream;
-        await video.play();
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        running = true;
-        camBtn.textContent = "⏹ 關閉視訊";
-        camBtn.classList.add('stop');
-        statusDiv.innerText = "🎥 視訊辨識中...";
-        loop();
-    }
-
-    function stopCamera() {
-        running = false;
-        if (stream) stream.getTracks().forEach(t => t.stop());
-        stream = null;
-        camBtn.textContent = "📹 開啟視訊";
-        camBtn.classList.remove('stop');
-        fpsSpan.textContent = "";
-        statusDiv.innerText = "⏹ 視訊已關閉。";
-    }
-
-    async function loop() {
-        let last = performance.now(), frames = 0, t0 = last;
-        while (running) {
-            const w = video.videoWidth, h = video.videoHeight;
-            if (w && h) {
-                if (canvas.width !== w) { canvas.width = w; canvas.height = h; }
-                const boxes = await detect(video, w, h);
-                if (!running) break;
-                ctx.drawImage(video, 0, 0, w, h);
-                drawBoxes(boxes);
-                frames++;
-                const now = performance.now();
-                if (now - t0 >= 1000) {
-                    fpsSpan.textContent = `${(frames * 1000 / (now - t0)).toFixed(1)} FPS`;
-                    frames = 0; t0 = now;
-                }
-            }
-            await new Promise(r => requestAnimationFrame(r));
-        }
-    }
-
-    // 圖片/影格預處理：轉為 1x3x640x640 張量
-    function preprocess(source) {
-        tempCtx.drawImage(source, 0, 0, 640, 640);
-        const { data } = tempCtx.getImageData(0, 0, 640, 640);
-        const plane = 640 * 640;
-        const f = new Float32Array(3 * plane);
-        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-            f[p] = data[i] / 255.0;
-            f[plane + p] = data[i + 1] / 255.0;
-            f[2 * plane + p] = data[i + 2] / 255.0;
-        }
-        return new ort.Tensor('float32', f, [1, 3, 640, 640]);
-    }
-
-    // 4. ONNX 輸出矩陣解析 (shape: [1, 5, 8400])
-    function postprocess(results, origW, origH, confThreshold) {
-        const data = results[Object.keys(results)[0]].data;
-        const boxes = [];
-        for (let i = 0; i < 8400; i++) {
-            const score = data[4 * 8400 + i];
-            if (score >= confThreshold) {
-                const cx = data[i], cy = data[8400 + i];
-                const w = data[2 * 8400 + i], h = data[3 * 8400 + i];
-                boxes.push({
-                    x: (cx - w / 2) * (origW / 640),
-                    y: (cy - h / 2) * (origH / 640),
-                    w: w * (origW / 640),
-                    h: h * (origH / 640),
-                    score
-                });
-            }
-        }
-        return filterOverlapBoxes(boxes);
-    }
-
-    // NMS
-    function filterOverlapBoxes(boxes) {
-        let c = [...boxes].sort((a, b) => b.score - a.score);
-        const result = [];
-        while (c.length > 0) {
-            const cur = c.shift();
-            result.push(cur);
-            c = c.filter(b => calculateIoU(cur, b) < 0.45);
-        }
-        return result;
-    }
-
-    function calculateIoU(a, b) {
-        const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
-        const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
-        const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-        return inter / (a.w * a.h + b.w * b.h - inter);
-    }
-
-    // 5. 繪製邊框與風險評估面板
-    function isHighRisk(box, imgHeight) {
-        const distToBottom = imgHeight - (box.y + box.h);
-        return distToBottom < imgHeight * 0.18 || box.h / imgHeight > 0.25;
-    }
-
-    function drawBoxes(boxes) {
-        const imgHeight = canvas.height;
-        let resultDiv = document.getElementById("risk-report");
-        if (!resultDiv) {
-            resultDiv = document.createElement("div");
-            resultDiv.id = "risk-report";
-            resultDiv.style.cssText = "margin-top:15px;padding:15px;font-size:16px;border-radius:8px;";
-            canvas.parentNode.appendChild(resultDiv);
-        }
-
-        if (!boxes || boxes.length === 0) {
-            resultDiv.style.backgroundColor = "#f0f0f0";
-            resultDiv.style.border = "1px solid #ccc";
-            resultDiv.innerHTML = "<b>系統評估結果：</b>畫面中未偵測到斑馬線。";
-            return;
-        }
-
-        const hasHighRisk = boxes.some(b => isHighRisk(b, imgHeight));
-        const overallColor = hasHighRisk ? "#FF3333" : "#00FF66";
-        const riskStatus = hasHighRisk ? "🔴 高風險（過於靠近路口轉角）" : "🟢 安全（退縮距離良好）";
-        const suggestion = hasHighRisk
-            ? "⚠️ 改善建議：斑馬線過於貼近轉角，轉彎車輛易生視線死角，建議向後退縮 3~5 公尺。"
-            : "✅ 評估結果：該路口斑馬線佈局符合安全退縮規範。";
-
-        resultDiv.style.backgroundColor = hasHighRisk ? "#FFE6E6" : "#E6FFE6";
-        resultDiv.style.border = `2px solid ${overallColor}`;
-        resultDiv.style.color = "#333333";
-        resultDiv.innerHTML = `
-            <h3 style="margin:0 0 8px 0;">🚦 靜態道路硬體危險度評估報告</h3>
-            <p style="margin:4px 0;"><b>辨識目標：</b>斑馬線 (Crosswalk)</p>
-            <p style="margin:4px 0;"><b>風險等級：</b><span style="color:${overallColor}; font-weight:bold;">${riskStatus}</span></p>
-            <p style="margin:4px 0;"><b>系統說明：</b>${suggestion}</p>`;
-
-        boxes.forEach(box => {
-            const color = isHighRisk(box, imgHeight) ? "#FF3333" : "#00FF66";
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 4;
-            ctx.strokeRect(box.x, box.y, box.w, box.h);
-            const text = `crosswalk ${(box.score * 100).toFixed(1)}%`;
-            ctx.font = "16px MingLiU, Arial";
-            const tw = ctx.measureText(text).width;
-            const ly = Math.max(box.y, 28);
-            ctx.fillStyle = color;
-            ctx.fillRect(box.x, ly - 28, tw + 10, 28);
-            ctx.fillStyle = "#FFFFFF";
-            ctx.fillText(text, box.x + 5, ly - 8);
-        });
-    }
-
-    window.addEventListener('DOMContentLoaded', initModel);
 </script>
-
-
 </body>
 </html>
