@@ -2,9 +2,9 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>交通號誌 AI 離線辨識系統 (ONNX Runtime)</title>
-    <!-- 引入 ONNX Runtime Web 官方套件 (CDN) -->
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <title>交通號誌 AI 雲端辨識系統 (Roboflow Workflow)</title>
+    <!-- 引入 Roboflow Inference SDK -->
+    <script src="https://cdn.jsdelivr.net/npm/@roboflow/inference@latest/dist/roboflow.min.js"></script>
     <style>
         body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f9; padding: 20px; }
         .container { max-width: 800px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
@@ -16,226 +16,207 @@
 <body>
 
 <div class="container">
-    <h2>🚦 斑馬線（Crosswalk）離線 AI 辨識系統</h2>
-    <div id="status">⏳ 正在載入 ONNX 模型中，請稍候...</div>
-    <input type="file" id="imageInput" accept="image/*" disabled>
+    <h2>🚦 斑馬線（Crosswalk）AI 雲端辨識系統</h2>
+    <div id="status">✅ 系統準備就緒，請上傳圖片進行辨識。</div>
+    <input type="file" id="imageInput" accept="image/*">
     <br>
     <canvas id="outputCanvas"></canvas>
 </div>
 
 <script>
-    let session = null;
     const statusDiv = document.getElementById('status');
     const imageInput = document.getElementById('imageInput');
     const canvas = document.getElementById('outputCanvas');
     const ctx = canvas.getContext('2d');
 
-    // 1. 載入模型
-    async function initModel() {
-        try {
-            session = await ort.InferenceSession.create('./best.onnx');
-            statusDiv.innerText = "✅ 模型載入完成！請選擇圖片進行辨識。";
-            imageInput.disabled = false;
-        } catch (e) {
-            statusDiv.innerText = "❌ 模型載入失敗，請確認 best.onnx 是否放在同目錄下。";
-            console.error(e);
-        }
-    }
+    // 1. 設定 Roboflow Workflow 參數
+    const API_KEY = "O92bxnfSHT1SezxPFGCB";
+    const WORKSPACE_NAME = "-ftvco";
+    const WORKFLOW_ID = "001-mrbjp-1-rfdetr-small-t2-v001-mrbjp-1-rfdetr-small-t2-logic";
 
-    // 2. 處理圖片上傳
+    // 2. 處理圖片上傳與 Workflow 推論
     imageInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
-        if (!file || !session) return;
+        if (!file) return;
 
         const img = new Image();
         img.src = URL.createObjectURL(file);
 
         img.onload = async () => {
+            // 初始化畫布尺寸
             canvas.width = img.width;
             canvas.height = img.height;
             ctx.drawImage(img, 0, 0);
 
-            statusDiv.innerText = "⚡ 正在地端推理中...";
-            
-            const tensor = await preprocessImage(img);
-            const results = await session.run({ images: tensor });
-            
-            // 執行 YOLOv8 / YOLO26 ONNX 後處理解析
-            const boxes = postprocess(results, img.width, img.height, 0.45);
-            
-            // 清除上次畫布並重新繪製圖片
-            ctx.drawImage(img, 0, 0);
-            
-            if (boxes.length === 0) {
-                statusDiv.innerText = "⚠️ 未偵測到斑馬線！";
-                drawBoxes([]); // 觸發未偵測到的文字提示
-            } else {
-                drawBoxes(boxes);
-                statusDiv.innerText = `✅ 辨識完成！共找到 ${boxes.length} 個斑馬線。`;
+            statusDiv.innerText = "⚡ 正在呼叫 Roboflow Workflow 雲端推論中...";
+            imageInput.disabled = true;
+
+            try {
+                // 將圖片轉為 Base64 字串送至 Workflow
+                const base64Image = await getBase64(file);
+                
+                const response = await fetch(`https://serverless.roboflow.com/workflows/${WORKSPACE_NAME}/${WORKFLOW_ID}?api_key=${API_KEY}`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        inputs: {
+                            "image": {
+                                "type": "base64",
+                                "value": base64Image
+                            }
+                        }
+                    })
+                });
+
+                const result = await response.json();
+                
+                // 解析 Workflow 輸出格式（嘗試提取預測框陣列）
+                const boxes = parseWorkflowResults(result, img.width, img.height);
+                
+                // 清除上次畫布並重新繪製圖片
+                ctx.drawImage(img, 0, 0);
+
+                if (boxes.length === 0) {
+                    statusDiv.innerText = "⚠️ 未偵測到斑馬線！";
+                    drawBoxes([]);
+                } else {
+                    drawBoxes(boxes);
+                    statusDiv.innerText = `✅ 辨識完成！共找到 ${boxes.length} 個斑馬線。`;
+                }
+
+            } catch (err) {
+                console.error("Workflow 推論錯誤：", err);
+                statusDiv.innerText = "❌ 辨識失敗，請檢查網路連線或 API Key 設定。";
+            } finally {
+                imageInput.disabled = false;
             }
         };
     });
 
-    // 圖片預處理：轉為 1x3x640x640 張量
-    async function preprocessImage(img) {
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = 640;
-        tempCanvas.height = 640;
-        const tempCtx = tempCanvas.getContext('2d');
-        tempCtx.drawImage(img, 0, 0, 640, 640);
-
-        const imgData = tempCtx.getImageData(0, 0, 640, 640);
-        const { data } = imgData;
-        const red = [], green = [], blue = [];
-
-        for (let i = 0; i < data.length; i += 4) {
-            red.push(data[i] / 255.0);
-            green.push(data[i + 1] / 255.0);
-            blue.push(data[i + 2] / 255.0);
-        }
-
-        const float32Data = new Float32Array([...red, ...green, ...blue]);
-        return new ort.Tensor('float32', float32Data, [1, 3, 640, 640]);
+    // 輔助函式：檔案轉 Base64
+    function getBase64(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result.split(',')[1]);
+            reader.onerror = error => reject(error);
+        });
     }
 
-    // 3. ONNX 輸出矩陣解析
-    function postprocess(results, origW, origH, confThreshold) {
-        const outputKey = Object.keys(results)[0];
-        const data = results[outputKey].data; // Shape: [1, 5, 8400]
+    // 3. 解析 Roboflow Workflow 回傳的 JSON 資料結構
+    function parseWorkflowResults(result, imgWidth, imgHeight) {
         const boxes = [];
-
-        for (let i = 0; i < 8400; i++) {
-            const score = data[4 * 8400 + i]; // 第 5 列為信心分數
-            
-            if (score >= confThreshold) {
-                const cx = data[0 * 8400 + i];
-                const cy = data[1 * 8400 + i];
-                const w = data[2 * 8400 + i];
-                const h = data[3 * 8400 + i];
-
-                const x = (cx - w / 2) * (origW / 640);
-                const y = (cy - h / 2) * (origH / 640);
-                const bw = w * (origW / 640);
-                const bh = h * (origH / 640);
-
-                boxes.push({ x, y, w: bw, h: bh, score });
+        
+        // 取得 workflow 輸出的結果點
+        let predictions = [];
+        if (result.outputs && Array.isArray(result.outputs)) {
+            const firstOutput = result.outputs[0];
+            // 搜尋輸出的 key 值
+            for (let key in firstOutput) {
+                if (firstOutput[key] && firstOutput[key].predictions) {
+                    predictions = firstOutput[key].predictions;
+                    break;
+                } else if (Array.isArray(firstOutput[key])) {
+                    predictions = firstOutput[key];
+                    break;
+                }
             }
         }
 
-        return filterOverlapBoxes(boxes);
-    }
+        predictions.forEach(pred => {
+            if (pred.x !== undefined && pred.y !== undefined && pred.width !== undefined && pred.height !== undefined) {
+                const bw = pred.width;
+                const bh = pred.height;
+                const x = pred.x - bw / 2;
+                const y = pred.y - bh / 2;
+                const score = pred.confidence || pred.score || 1.0;
 
-    // NMS 重疊框過濾器
-    function filterOverlapBoxes(boxes) {
-        let candidateBoxes = [...boxes];
-        candidateBoxes.sort((a, b) => b.score - a.score);
-        const result = [];
-        while (candidateBoxes.length > 0) {
-            const current = candidateBoxes.shift();
-            result.push(current);
-            candidateBoxes = candidateBoxes.filter(box => {
-                const iou = calculateIoU(current, box);
-                return iou < 0.45;
-            });
-        }
-        return result;
-    }
+                boxes.push({ x, y, w: bw, h: bh, score });
+            }
+        });
 
-    function calculateIoU(a, b) {
-        const x1 = Math.max(a.x, b.x);
-        const y1 = Math.max(a.y, b.y);
-        const x2 = Math.min(a.x + a.w, b.x + b.w);
-        const y2 = Math.min(a.y + a.h, b.y + b.h);
-        const intersection = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-        const union = (a.w * a.h) + (b.w * b.h) - intersection;
-        return intersection / union;
+        return boxes;
     }
 
     // 4. 在 Canvas 上繪製邊框與顯示風險評估面板
-  function drawBoxes(boxes) {
-    const canvasEl = typeof canvas !== 'undefined' ? canvas : document.querySelector('canvas');
-    if (!canvasEl) return;
-    
-    const ctxEl = canvasEl.getContext('2d');
-    const imgHeight = canvasEl.height;
-    
-    let resultDiv = document.getElementById("risk-report");
-    if (!resultDiv) {
-        resultDiv = document.createElement("div");
-        resultDiv.id = "risk-report";
-        resultDiv.style.marginTop = "15px";
-        resultDiv.style.padding = "15px";
-        resultDiv.style.fontSize = "16px";
-        resultDiv.style.fontFamily = "MingLiU, sans-serif";
-        resultDiv.style.borderRadius = "8px";
-        canvasEl.parentNode.appendChild(resultDiv);
-    }
-
-    if (!boxes || boxes.length === 0) {
-        resultDiv.style.backgroundColor = "#f0f0f0";
-        resultDiv.style.border = "1px solid #ccc";
-        resultDiv.innerHTML = "<b>系統評估結果：</b>畫面中未偵測到斑馬線。";
-        return;
-    }
-
-    // 💡 先檢查所有框框中，有沒有任何一個屬於「高風險」
-    let hasHighRisk = false;
-    boxes.forEach(box => {
-        const boxBottom = box.y + box.h;
-        const distToBottom = imgHeight - boxBottom;
-        const boxHeightRatio = box.h / imgHeight;
-
-        // 只要【離底端小於 18%】或【斑馬線佔據畫面高度超過 25%】，就認定為高風險
-        if (distToBottom < imgHeight * 0.18 || boxHeightRatio > 0.25) {
-            hasHighRisk = true;
-        }
-    });
-
-    // 1. 先更新下方的整體系統報告面板
-    const overallColor = hasHighRisk ? "#FF3333" : "#00FF66";
-    const riskStatus = hasHighRisk ? "🔴 高風險（過於靠近路口轉角）" : "🟢 安全（退縮距離良好）";
-    const suggestion = hasHighRisk 
-        ? "⚠️ 改善建議：斑馬線過於貼近轉角，轉彎車輛易生視線死角，建議向後退縮 3~5 公尺。" 
-        : "✅ 評估結果：該路口斑馬線佈局符合安全退縮規範。";
-
-    resultDiv.style.backgroundColor = hasHighRisk ? "#FFE6E6" : "#E6FFE6";
-    resultDiv.style.border = `2px solid ${overallColor}`;
-    resultDiv.style.color = "#333333";
-    resultDiv.innerHTML = `
-        <h3 style="margin:0 0 8px 0;">🚦 靜態道路硬體危險度評估報告</h3>
-        <p style="margin:4px 0;"><b>辨識目標：</b>斑馬線 (Crosswalk)</p>
-        <p style="margin:4px 0;"><b>風險等級：</b><span style="color:${overallColor}; font-weight:bold;">${riskStatus}</span></p>
-        <p style="margin:4px 0;"><b>系統說明：</b>${suggestion}</p>
-    `;
-
-    // 2. 逐一繪製每個斑馬線框框（個別顯示自己的顏色）
-    boxes.forEach(box => {
-        const boxBottom = box.y + box.h;
-        const distToBottom = imgHeight - boxBottom;
-        const boxHeightRatio = box.h / imgHeight;
-
-        // 條件同步更新
-        const isHighRisk = (distToBottom < imgHeight * 0.18) || (boxHeightRatio > 0.25);
-        const color = isHighRisk ? "#FF3333" : "#00FF66";
-
-        ctxEl.strokeStyle = color;
-        ctxEl.lineWidth = 4;
-        ctxEl.strokeRect(box.x, box.y, box.w, box.h);
-
-        // 修正乘號 * 與語法
-        const text = `crosswalk ${(box.score * 100).toFixed(1)}%`;
-        ctxEl.font = "16px MingLiU, Arial";
-        const textWidth = ctxEl.measureText(text).width;
+    function drawBoxes(boxes) {
+        const canvasEl = canvas;
+        const ctxEl = ctx;
+        const imgHeight = canvasEl.height;
         
-        ctxEl.fillStyle = color;
-        ctxEl.fillRect(box.x, box.y - 28, textWidth + 10, 28);
-        ctxEl.fillStyle = "#FFFFFF";
-        ctxEl.fillText(text, box.x + 5, box.y - 8);
-    });
-}
+        let resultDiv = document.getElementById("risk-report");
+        if (!resultDiv) {
+            resultDiv = document.createElement("div");
+            resultDiv.id = "risk-report";
+            resultDiv.style.marginTop = "15px";
+            resultDiv.style.padding = "15px";
+            resultDiv.style.fontSize = "16px";
+            resultDiv.style.fontFamily = "MingLiU, sans-serif";
+            resultDiv.style.borderRadius = "8px";
+            canvasEl.parentNode.appendChild(resultDiv);
+        }
 
-    // 啟動模型
-    initModel();
+        if (!boxes || boxes.length === 0) {
+            resultDiv.style.backgroundColor = "#f0f0f0";
+            resultDiv.style.border = "1px solid #ccc";
+            resultDiv.innerHTML = "<b>系統評估結果：</b>畫面中未偵測到斑馬線。";
+            return;
+        }
+
+        // 檢查是否有任何一個區域屬於高風險
+        let hasHighRisk = false;
+        boxes.forEach(box => {
+            const boxBottom = box.y + box.h;
+            const distToBottom = imgHeight - boxBottom;
+            const boxHeightRatio = box.h / imgHeight;
+
+            if (distToBottom < imgHeight * 0.18 || boxHeightRatio > 0.25) {
+                hasHighRisk = true;
+            }
+        });
+
+        // 1. 更新系統評估報告
+        const overallColor = hasHighRisk ? "#FF3333" : "#00FF66";
+        const riskStatus = hasHighRisk ? "🔴 高風險（過於靠近路口轉角）" : "🟢 安全（退縮距離良好）";
+        const suggestion = hasHighRisk 
+            ? "⚠️ 改善建議：斑馬線過於貼近轉角，轉彎車輛易生視線死角，建議向後退縮 3~5 公尺。" 
+            : "✅ 評估結果：該路口斑馬線佈局符合安全退縮規範。";
+
+        resultDiv.style.backgroundColor = hasHighRisk ? "#FFE6E6" : "#E6FFE6";
+        resultDiv.style.border = `2px solid ${overallColor}`;
+        resultDiv.style.color = "#333333";
+        resultDiv.innerHTML = `
+            <h3 style="margin:0 0 8px 0;">🚦 靜態道路硬體危險度評估報告</h3>
+            <p style="margin:4px 0;"><b>辨識目標：</b>斑馬線 (Crosswalk)</p>
+            <p style="margin:4px 0;"><b>風險等級：</b><span style="color:${overallColor}; font-weight:bold;">${riskStatus}</span></p>
+            <p style="margin:4px 0;"><b>系統說明：</b>${suggestion}</p>
+        `;
+
+        // 2. 逐一繪製標記框
+        boxes.forEach(box => {
+            const boxBottom = box.y + box.h;
+            const distToBottom = imgHeight - boxBottom;
+            const boxHeightRatio = box.h / imgHeight;
+
+            const isHighRisk = (distToBottom < imgHeight * 0.18) || (boxHeightRatio > 0.25);
+            const color = isHighRisk ? "#FF3333" : "#00FF66";
+
+            ctxEl.strokeStyle = color;
+            ctxEl.lineWidth = 4;
+            ctxEl.strokeRect(box.x, box.y, box.w, box.h);
+
+            const text = `crosswalk ${(box.score * 100).toFixed(1)}%`;
+            ctxEl.font = "16px MingLiU, Arial";
+            const textWidth = ctxEl.measureText(text).width;
+            
+            ctxEl.fillStyle = color;
+            ctxEl.fillRect(box.x, box.y - 28, textWidth + 10, 28);
+            ctxEl.fillStyle = "#FFFFFF";
+            ctxEl.fillText(text, box.x + 5, box.y - 8);
+        });
+    }
 </script>
 
 </body>
