@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>斑馬線 AI 離線辨識系統 (ONNX Runtime)</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f9; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        #status { font-weight: bold; color: #2e7d32; margin: 10px 0; }
+        canvas { max-width: 100%; height: auto; margin-top: 15px; border: 2px solid #ddd; border-radius: 8px; }
+        .controls { display: flex; gap: 12px; justify-content: center; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+        button { padding: 9px 18px; font-size: 15px; border: 0; border-radius: 8px; background: #1976d2; color: #fff; cursor: pointer; }
+        button:disabled { background: #aaa; cursor: not-allowed; }
+        button.stop { background: #d32f2f; }
+        #fps { color: #666; font-size: 14px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>🚦 斑馬線（Crosswalk）離線 AI 辨識系統</h2>
+    <p style="font-size:14px">視訊＋上傳版 ｜ <a href="image.html">切換到純圖片版</a></p>
+    <div id="status">⏳ 正在載入 ONNX 模型中，請稍候...</div>
+    <div class="controls">
+        <input type="file" id="imageInput" accept="image/*" disabled>
+        <button id="camBtn" disabled>📹 開啟視訊</button>
+        <span id="fps"></span>
+    </div>
+    <canvas id="outputCanvas"></canvas>
+</div>
+<video id="video" playsinline muted style="display:none"></video>
+
+<script>
+    let session = null;
+    let stream = null;
+    let running = false;
+    const statusDiv = document.getElementById('status');
+    const imageInput = document.getElementById('imageInput');
+    const camBtn = document.getElementById('camBtn');
+    const fpsSpan = document.getElementById('fps');
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('outputCanvas');
+    const ctx = canvas.getContext('2d');
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 640; tempCanvas.height = 640;
+    const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+    const CONF = 0.45;
+
+    // 1. 載入模型（內嵌於本頁）
+    async function initModel() {
+        try {
+            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+            const res = await fetch('./best.onnx');
+            if (!res.ok) throw new Error('best.onnx HTTP ' + res.status);
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            session = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
+            statusDiv.innerText = "✅ 模型載入完成！請選擇圖片或開啟視訊進行辨識。";
+            imageInput.disabled = false;
+            camBtn.disabled = false;
+        } catch (e) {
+            statusDiv.innerText = "❌ 模型載入失敗，請確認 best.onnx 與本頁放在同一個資料夾，且網路可連線至 CDN。";
+            console.error(e);
+        }
+    }
+
+    // 統一推理：source 可為 Image 或 Video
+    async function detect(source, w, h) {
+        const tensor = preprocess(source);
+        const results = await session.run({ images: tensor });
+        return postprocess(results, w, h, CONF);
+    }
+
+    // 2. 上傳圖片
+    imageInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file || !session) return;
+        if (running) stopCamera();
+        const img = new Image();
+        img.src = URL.createObjectURL(file);
+        img.onload = async () => {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+            statusDiv.innerText = "⚡ 正在地端推理中...";
+            const boxes = await detect(img, img.width, img.height);
+            ctx.drawImage(img, 0, 0);
+            drawBoxes(boxes);
+            statusDiv.innerText = boxes.length
+                ? `✅ 辨識完成！共找到 ${boxes.length} 個斑馬線。`
+                : "⚠️ 未偵測到斑馬線！";
+        };
+    });
+
+    // 3. 視訊模式
+    camBtn.addEventListener('click', () => running ? stopCamera() : startCamera());
+
+    async function startCamera() {
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: { ideal: 'environment' }, width: { ideal: 960 }, height: { ideal: 720 } },
+                audio: false
+            });
+        } catch (e) {
+            statusDiv.innerText = "❌ 無法開啟鏡頭，請允許瀏覽器使用攝影機（需 https 或 localhost）。";
+            console.error(e);
+            return;
+        }
+        video.srcObject = stream;
+        await video.play();
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        running = true;
+        camBtn.textContent = "⏹ 關閉視訊";
+        camBtn.classList.add('stop');
+        statusDiv.innerText = "🎥 視訊辨識中...";
+        loop();
+    }
+
+    function stopCamera() {
+        running = false;
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        stream = null;
+        camBtn.textContent = "📹 開啟視訊";
+        camBtn.classList.remove('stop');
+        fpsSpan.textContent = "";
+        statusDiv.innerText = "⏹ 視訊已關閉。";
+    }
+
+    async function loop() {
+        let last = performance.now(), frames = 0, t0 = last;
+        while (running) {
+            const w = video.videoWidth, h = video.videoHeight;
+            if (w && h) {
+                if (canvas.width !== w) { canvas.width = w; canvas.height = h; }
+                const boxes = await detect(video, w, h);
+                if (!running) break;
+                ctx.drawImage(video, 0, 0, w, h);
+                drawBoxes(boxes);
+                frames++;
+                const now = performance.now();
+                if (now - t0 >= 1000) {
+                    fpsSpan.textContent = `${(frames * 1000 / (now - t0)).toFixed(1)} FPS`;
+                    frames = 0; t0 = now;
+                }
+            }
+            await new Promise(r => requestAnimationFrame(r));
+        }
+    }
+
+    // 圖片/影格預處理：轉為 1x3x640x640 張量
+    function preprocess(source) {
+        tempCtx.drawImage(source, 0, 0, 640, 640);
+        const { data } = tempCtx.getImageData(0, 0, 640, 640);
+        const plane = 640 * 640;
+        const f = new Float32Array(3 * plane);
+        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+            f[p] = data[i] / 255.0;
+            f[plane + p] = data[i + 1] / 255.0;
+            f[2 * plane + p] = data[i + 2] / 255.0;
+        }
+        return new ort.Tensor('float32', f, [1, 3, 640, 640]);
+    }
+
+    // 4. ONNX 輸出矩陣解析 (shape: [1, 5, 8400])
+    function postprocess(results, origW, origH, confThreshold) {
+        const data = results[Object.keys(results)[0]].data;
+        const boxes = [];
+        for (let i = 0; i < 8400; i++) {
+            const score = data[4 * 8400 + i];
+            if (score >= confThreshold) {
+                const cx = data[i], cy = data[8400 + i];
+                const w = data[2 * 8400 + i], h = data[3 * 8400 + i];
+                boxes.push({
+                    x: (cx - w / 2) * (origW / 640),
+                    y: (cy - h / 2) * (origH / 640),
+                    w: w * (origW / 640),
+                    h: h * (origH / 640),
+                    score
+                });
+            }
+        }
+        return filterOverlapBoxes(boxes);
+    }
+
+    // NMS
+    function filterOverlapBoxes(boxes) {
+        let c = [...boxes].sort((a, b) => b.score - a.score);
+        const result = [];
+        while (c.length > 0) {
+            const cur = c.shift();
+            result.push(cur);
+            c = c.filter(b => calculateIoU(cur, b) < 0.45);
+        }
+        return result;
+    }
+
+    function calculateIoU(a, b) {
+        const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+        const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+        const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+        return inter / (a.w * a.h + b.w * b.h - inter);
+    }
+
+    // 5. 繪製邊框與風險評估面板
+    function isHighRisk(box, imgHeight) {
+        const distToBottom = imgHeight - (box.y + box.h);
+        return distToBottom < imgHeight * 0.18 || box.h / imgHeight > 0.25;
+    }
+
+    function drawBoxes(boxes) {
+        const imgHeight = canvas.height;
+        let resultDiv = document.getElementById("risk-report");
+        if (!resultDiv) {
+            resultDiv = document.createElement("div");
+            resultDiv.id = "risk-report";
+            resultDiv.style.cssText = "margin-top:15px;padding:15px;font-size:16px;border-radius:8px;";
+            canvas.parentNode.appendChild(resultDiv);
+        }
+
+        if (!boxes || boxes.length === 0) {
+            resultDiv.style.backgroundColor = "#f0f0f0";
+            resultDiv.style.border = "1px solid #ccc";
+            resultDiv.innerHTML = "<b>系統評估結果：</b>畫面中未偵測到斑馬線。";
+            return;
+        }
+
+        const hasHighRisk = boxes.some(b => isHighRisk(b, imgHeight));
+        const overallColor = hasHighRisk ? "#FF3333" : "#00FF66";
+        const riskStatus = hasHighRisk ? "🔴 高風險（過於靠近路口轉角）" : "🟢 安全（退縮距離良好）";
+        const suggestion = hasHighRisk
+            ? "⚠️ 改善建議：斑馬線過於貼近轉角，轉彎車輛易生視線死角，建議向後退縮 3~5 公尺。"
+            : "✅ 評估結果：該路口斑馬線佈局符合安全退縮規範。";
+
+        resultDiv.style.backgroundColor = hasHighRisk ? "#FFE6E6" : "#E6FFE6";
+        resultDiv.style.border = `2px solid ${overallColor}`;
+        resultDiv.style.color = "#333333";
+        resultDiv.innerHTML = `
+            <h3 style="margin:0 0 8px 0;">🚦 靜態道路硬體危險度評估報告</h3>
+            <p style="margin:4px 0;"><b>辨識目標：</b>斑馬線 (Crosswalk)</p>
+            <p style="margin:4px 0;"><b>風險等級：</b><span style="color:${overallColor}; font-weight:bold;">${riskStatus}</span></p>
+            <p style="margin:4px 0;"><b>系統說明：</b>${suggestion}</p>`;
+
+        boxes.forEach(box => {
+            const color = isHighRisk(box, imgHeight) ? "#FF3333" : "#00FF66";
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 4;
+            ctx.strokeRect(box.x, box.y, box.w, box.h);
+            const text = `crosswalk ${(box.score * 100).toFixed(1)}%`;
+            ctx.font = "16px MingLiU, Arial";
+            const tw = ctx.measureText(text).width;
+            const ly = Math.max(box.y, 28);
+            ctx.fillStyle = color;
+            ctx.fillRect(box.x, ly - 28, tw + 10, 28);
+            ctx.fillStyle = "#FFFFFF";
+            ctx.fillText(text, box.x + 5, ly - 8);
+        });
+    }
+
+    window.addEventListener('DOMContentLoaded', initModel);
+</script>
+
+
+</body>
+</html>
