@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>交通號誌 AI 辨識（Roboflow 雲端模型）</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background: #f4f4f9; padding: 20px; }
+        .container { max-width: 860px; margin: 0 auto; background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        #status { font-weight: bold; color: #2e7d32; margin: 10px 0; min-height: 1.4em; }
+        #status.err { color: #c62828; }
+        canvas { max-width: 100%; height: auto; margin-top: 15px; border: 2px solid #ddd; border-radius: 8px; }
+        .controls { display: flex; gap: 14px; justify-content: center; align-items: center; flex-wrap: wrap; margin: 12px 0; }
+        button { padding: 9px 18px; font-size: 15px; border: 0; border-radius: 8px; background: #1976d2; color: #fff; cursor: pointer; }
+        button.stop { background: #d32f2f; }
+        select, input[type=range] { font-size: 15px; }
+        label { font-size: 14px; color: #444; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h2>🚦 交通號誌（Traffic Signal）AI 辨識</h2>
+    <p style="font-size:13px;color:#666;margin:0">模型由 Roboflow 雲端執行（專案 001），需要網路連線</p>
+    <div id="status">請選擇圖片或開啟視訊。</div>
+    <div class="controls">
+        <label>模型
+            <select id="model">
+                <option value="-ftvco/001-mrbjp-1-rfdetr-small-t2">RF-DETR Small（mAP50 74.6）</option>
+                <option value="001-mrbjp/1">YOLO26n（較輕量）</option>
+            </select>
+        </label>
+        <label>信心門檻 <input type="range" id="conf" min="5" max="90" value="25"> <span id="confVal">25%</span></label>
+    </div>
+    <div class="controls">
+        <input type="file" id="imageInput" accept="image/*">
+        <button id="camBtn">📹 開啟視訊</button>
+        <span id="info" style="font-size:14px;color:#666"></span>
+    </div>
+    <canvas id="outputCanvas" width="640" height="360"></canvas>
+</div>
+<video id="video" playsinline muted style="display:none"></video>
+
+<script>
+    // Roboflow 公開金鑰（publishable key），可安全放在網頁裡；不要放私密 API key
+    const PUBLISHABLE_KEY = 'rf_81ce3bTle7Phiy6kTJpkoSOnmMz2';
+    const API_BASE = 'https://serverless.roboflow.com/';
+
+    const $ = id => document.getElementById(id);
+    const canvas = $('outputCanvas'), ctx = canvas.getContext('2d');
+    const video = $('video'), statusDiv = $('status');
+    let stream = null, running = false;
+
+    $('conf').addEventListener('input', () => $('confVal').textContent = $('conf').value + '%');
+
+    function setStatus(t, err = false) { statusDiv.textContent = t; statusDiv.className = err ? 'err' : ''; }
+
+    // 把來源（圖片或影像）縮到最長邊 640 後送出，回傳 {preds, w, h, canvasW, canvasH}
+    async function infer(source, sw, sh) {
+        const scale = Math.min(1, 640 / Math.max(sw, sh));
+        const c = document.createElement('canvas');
+        c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
+        c.getContext('2d').drawImage(source, 0, 0, c.width, c.height);
+        const b64 = c.toDataURL('image/jpeg', 0.85).split(',')[1];
+        // confidence 送很低的值，再由前端依滑桿過濾（避免 0-1 / 0-100 單位差異）
+        const url = `${API_BASE}${$('model').value}?api_key=${PUBLISHABLE_KEY}&confidence=0.1`;
+        const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b64 });
+        if (!res.ok) throw new Error(`Roboflow 回應 HTTP ${res.status}：${(await res.text()).slice(0, 120)}`);
+        const json = await res.json();
+        const iw = json.image?.width || c.width, ih = json.image?.height || c.height;
+        const min = $('conf').value / 100;
+        const preds = (json.predictions || []).filter(p => p.confidence >= min).map(p => ({
+            x: (p.x - p.width / 2) * sw / iw, y: (p.y - p.height / 2) * sh / ih,
+            w: p.width * sw / iw, h: p.height * sh / ih, score: p.confidence, cls: p.class
+        }));
+        return preds;
+    }
+
+    function draw(source, sw, sh, boxes) {
+        if (canvas.width !== sw) { canvas.width = sw; canvas.height = sh; }
+        ctx.drawImage(source, 0, 0, sw, sh);
+        const lw = Math.max(2, sw / 300);
+        boxes.forEach(b => {
+            ctx.strokeStyle = '#00E676'; ctx.lineWidth = lw;
+            ctx.strokeRect(b.x, b.y, b.w, b.h);
+            const t = `${b.cls} ${(b.score * 100).toFixed(0)}%`;
+            const fs = Math.max(14, sw / 50); ctx.font = `${fs}px Arial`;
+            const tw = ctx.measureText(t).width, ly = Math.max(b.y, fs + 6);
+            ctx.fillStyle = '#00E676'; ctx.fillRect(b.x, ly - fs - 6, tw + 10, fs + 6);
+            ctx.fillStyle = '#000'; ctx.fillText(t, b.x + 5, ly - 6);
+        });
+    }
+
+    $('imageInput').addEventListener('change', e => {
+        const f = e.target.files[0]; if (!f) return;
+        if (running) stopCamera();
+        const img = new Image(); img.src = URL.createObjectURL(f);
+        img.onload = async () => {
+            draw(img, img.width, img.height, []);
+            setStatus('⚡ 雲端推理中...');
+            try {
+                const t0 = performance.now();
+                const boxes = await infer(img, img.width, img.height);
+                draw(img, img.width, img.height, boxes);
+                setStatus(boxes.length ? `✅ 找到 ${boxes.length} 個交通號誌（${((performance.now() - t0) / 1000).toFixed(1)} 秒）` : '⚠️ 未偵測到交通號誌，可試著調低信心門檻。');
+            } catch (err) { setStatus('❌ ' + err.message, true); console.error(err); }
+        };
+    });
+
+    $('camBtn').addEventListener('click', () => running ? stopCamera() : startCamera());
+
+    async function startCamera() {
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 960 } }, audio: false });
+        } catch (e) { setStatus('❌ 無法開啟鏡頭（需 https，並允許攝影機權限）', true); return; }
+        video.srcObject = stream; await video.play();
+        running = true; $('camBtn').textContent = '⏹ 關閉視訊'; $('camBtn').classList.add('stop');
+        setStatus('🎥 視訊辨識中...'); loop();
+    }
+    function stopCamera() {
+        running = false; if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+        $('camBtn').textContent = '📹 開啟視訊'; $('camBtn').classList.remove('stop'); $('info').textContent = '';
+        setStatus('⏹ 視訊已關閉。');
+    }
+    // 一次只送一張，等回應後再取下一張，避免請求堆積
+    async function loop() {
+        while (running) {
+            const w = video.videoWidth, h = video.videoHeight;
+            if (!w) { await new Promise(r => setTimeout(r, 100)); continue; }
+            const t0 = performance.now();
+            try {
+                const boxes = await infer(video, w, h);
+                if (!running) break;
+                draw(video, w, h, boxes);
+                $('info').textContent = `${boxes.length} 個號誌 ｜ ${(1000 / (performance.now() - t0)).toFixed(1)} FPS`;
+            } catch (err) { setStatus('❌ ' + err.message, true); stopCamera(); return; }
+        }
+    }
+</script>
+</body>
+</html>
