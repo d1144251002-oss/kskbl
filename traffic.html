@@ -4,11 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>紅綠燈辨識｜視訊＋圖片</title>
+<meta name="description" content="在瀏覽器內離線辨識斑馬線與紅綠燈的校園道路安全 AI 專題">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%276%27 fill=%27%230e6b45%27/%3E%3Crect x=%2713%27 y=%274%27 width=%276%27 height=%2724%27 fill=%27%23f2c230%27/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.webgpu.min.js"></script>
 </head>
 <body>
 <header class="hero">
@@ -52,18 +54,31 @@ const tmp = document.createElement('canvas'); tmp.width = 640; tmp.height = 640;
 const tctx = tmp.getContext('2d', { willReadFrequently: true });
 const canvas = $('outputCanvas'), ctx = canvas.getContext('2d');
 
+let backend = 'CPU', modelBytes = null;
+async function makeSession(providers) {
+  return ort.InferenceSession.create(modelBytes, { executionProviders: providers });
+}
 async function initModel() {
   try {
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
-    UI.status('正在載入紅綠燈模型（約 10 MB）…', 'busy');
+    UI.status('正在載入模型…', 'busy');
     const res = await fetch('./traffic.onnx');
     if (!res.ok) throw new Error('best.onnx HTTP ' + res.status);
-    session = await ort.InferenceSession.create(new Uint8Array(await res.arrayBuffer()), { executionProviders: ['wasm'] });
+    const total = +res.headers.get('content-length') || 0, reader = res.body.getReader(), chunks = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      chunks.push(value); got += value.length;
+      if (total) UI.status(`正在載入模型… ${Math.min(100, Math.round(got / total * 100))}%`, 'busy');
+    }
+    modelBytes = new Uint8Array(got); let o = 0; for (const c of chunks) { modelBytes.set(c, o); o += c.length; }
+    UI.status('正在啟動模型…', 'busy');
+    try { if (!navigator.gpu) throw 0; session = await makeSession(['webgpu']); backend = 'GPU 加速'; }
+    catch (_) { session = await makeSession(['wasm']); backend = 'CPU'; }
     $('imageInput').disabled = false; $('pickBtn').classList.remove('disabled');
     if ($('camBtn')) $('camBtn').classList.remove('disabled');
-    UI.status('模型已就緒，請選擇圖片' + ($('camBtn') ? '或開啟視訊。' : '。'));
+    UI.status('模型已就緒（' + backend + '），請選擇圖片' + ($('camBtn') ? '或開啟視訊。' : '。'));
   } catch (e) {
-    UI.status('模型載入失敗：請確認 best.onnx 與本頁在同一個資料夾，且網路能連到 CDN。', 'err');
+    UI.status('模型載入失敗：請確認模型檔與本頁在同一個資料夾，且網路能連到 CDN。', 'err');
     console.error(e);
   }
 }
@@ -77,7 +92,13 @@ function preprocess(src) {
   return new ort.Tensor('float32', f, [1, 3, 640, 640]);
 }
 async function detect(src, w, h) {
-  const out = await session.run({ images: preprocess(src) });
+  const input = preprocess(src); let out;
+  try { out = await session.run({ images: input }); }
+  catch (e) {
+    if (backend !== 'GPU 加速') throw e;
+    session = await makeSession(['wasm']); backend = 'CPU';
+    out = await session.run({ images: input });
+  }
   const d = out[Object.keys(out)[0]].data, boxes = [];
   for (let i = 0; i < 8400; i++) {
     const s = d[4 * 8400 + i];
@@ -110,7 +131,7 @@ function render(src, w, h, boxes) {
     ctx.fillStyle = '#f2c230'; ctx.fillRect(b.x, ly - fs - 10, tw + 14, fs + 10);
     ctx.fillStyle = '#25282c'; ctx.fillText(t, b.x + 7, ly - 6);
   });
-  const rep = $('report');
+  const rep = reportBox();
   rep.className = 'result' + (boxes.length ? ' safe' : '');
   rep.innerHTML = boxes.length ? `<div class="count">${boxes.length}</div><p>個紅綠燈</p>` : '<h3>沒有找到紅綠燈</h3><p>可以把信心門檻調低一點再試。</p>';
 }
@@ -129,7 +150,7 @@ $('imageInput').addEventListener('change', e => {
 });
 window.addEventListener('DOMContentLoaded', initModel);
 
-let stream = null, running = false;
+let stream = null, running = false, latest = [];
 const video = $('video');
 $('camBtn').addEventListener('click', () => running ? stopCamera() : startCamera());
 async function startCamera() {
@@ -137,26 +158,32 @@ async function startCamera() {
     stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 960 } }, audio: false });
   } catch (e) { UI.status('無法開啟鏡頭：請允許瀏覽器使用攝影機，並確認網址是 https。', 'err'); return; }
   video.srcObject = stream; await video.play();
-  running = true; $('camBtn').textContent = '關閉視訊'; $('camBtn').classList.add('stop');
-  UI.status('視訊辨識中…', 'busy'); loop();
+  running = true; latest = []; $('camBtn').textContent = '關閉視訊'; $('camBtn').classList.add('stop');
+  UI.status('視訊辨識中…', 'busy'); drawLoop(); inferLoop();
 }
 function stopCamera() {
-  running = false; if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+  running = false; latest = []; if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
   $('camBtn').textContent = '開啟視訊'; $('camBtn').classList.remove('stop'); $('fps').textContent = '';
   UI.status('視訊已關閉。');
 }
-async function loop() {
-  let frames = 0, t0 = performance.now();
+// 畫面：每一幀都更新，疊上最新一次的辨識結果，所以影像不會卡頓
+function drawLoop() {
+  if (!running) return;
+  const w = video.videoWidth, h = video.videoHeight;
+  if (w && h) render(video, w, h, latest);
+  requestAnimationFrame(drawLoop);
+}
+// 辨識：在背景一張接一張跑，跑多快就多快
+async function inferLoop() {
+  let n = 0, t0 = performance.now();
   while (running) {
     const w = video.videoWidth, h = video.videoHeight;
-    if (w && h) {
-      const boxes = await detect(video, w, h);
-      if (!running) break;
-      render(video, w, h, boxes); frames++;
-      const now = performance.now();
-      if (now - t0 >= 1000) { $('fps').textContent = `${(frames * 1000 / (now - t0)).toFixed(1)} FPS`; frames = 0; t0 = now; }
-    }
-    await new Promise(r => requestAnimationFrame(r));
+    if (!(w && h)) { await new Promise(r => setTimeout(r, 50)); continue; }
+    try { const r = await detect(video, w, h); if (!running) break; latest = r; }
+    catch (e) { UI.status('辨識發生錯誤，視訊已停止。', 'err'); console.error(e); stopCamera(); return; }
+    n++; const now = performance.now();
+    if (now - t0 >= 1000) { $('fps').textContent = `辨識 ${(n * 1000 / (now - t0)).toFixed(1)} 次／秒（${backend}）`; n = 0; t0 = now; }
+    await new Promise(r => setTimeout(r, 0));
   }
 }
 

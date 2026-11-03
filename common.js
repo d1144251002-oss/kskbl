@@ -16,3 +16,12 @@ const UI = {
     input.dispatchEvent(new Event('change'));
   });
 })();
+
+// 結果區只在內容真的改變時才更新，視訊每秒數十幀也不會一直重繪文字
+function reportBox() {
+  const el = $('report');
+  return {
+    set className(v) { if (el.className !== v) el.className = v; },
+    set innerHTML(v) { if (el._h !== v) { el._h = v; el.innerHTML = v; } },
+  };
+}
